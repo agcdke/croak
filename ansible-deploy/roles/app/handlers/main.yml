@@ -1,0 +1,20 @@
+---
+- name: restart rag-api
+  systemd:
+    name:  rag-api
+    state: restarted
+
+- name: restart rag-mcp
+  systemd:
+    name:  rag-mcp
+    state: restarted
+
+- name: restart rag-ui
+  systemd:
+    name:  rag-ui
+    state: restarted
+
+- name: reload nginx
+  systemd:
+    name:  nginx
+    state: reloaded

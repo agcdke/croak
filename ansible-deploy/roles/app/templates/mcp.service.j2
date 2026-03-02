@@ -1,0 +1,18 @@
+[Unit]
+Description=RAG Chatbot — FastMCP
+After=network.target rag-api.service
+Requires=rag-api.service
+
+[Service]
+Type=simple
+User={{ app_user }}
+WorkingDirectory={{ app_dir }}
+EnvironmentFile={{ app_dir }}/.env
+ExecStart={{ app_venv }}/bin/python -m src.mcp.server
+Restart=always
+RestartSec=5
+StandardOutput=append:{{ app_dir }}/logs/mcp.log
+StandardError=append:{{ app_dir }}/logs/mcp.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,51 @@
+---
+# roles/nginx/tasks/main.yml
+# Installs and configures Nginx as a reverse proxy.
+
+- name: Install Nginx
+  apt:
+    name:  nginx
+    state: present
+
+- name: Remove default Nginx site
+  file:
+    path:  /etc/nginx/sites-enabled/default
+    state: absent
+
+- name: Deploy Nginx config for API server
+  when: server_role == 'api'
+  template:
+    src:  nginx_api.conf.j2
+    dest: /etc/nginx/sites-available/rag-api.conf
+    mode: "0644"
+  notify: reload nginx
+
+- name: Enable API Nginx site
+  when: server_role == 'api'
+  file:
+    src:   /etc/nginx/sites-available/rag-api.conf
+    dest:  /etc/nginx/sites-enabled/rag-api.conf
+    state: link
+  notify: reload nginx
+
+- name: Deploy Nginx config for UI server
+  when: server_role == 'ui'
+  template:
+    src:  nginx_ui.conf.j2
+    dest: /etc/nginx/sites-available/rag-ui.conf
+    mode: "0644"
+  notify: reload nginx
+
+- name: Enable UI Nginx site
+  when: server_role == 'ui'
+  file:
+    src:   /etc/nginx/sites-available/rag-ui.conf
+    dest:  /etc/nginx/sites-enabled/rag-ui.conf
+    state: link
+  notify: reload nginx
+
+- name: Start and enable Nginx
+  systemd:
+    name:    nginx
+    state:   started
+    enabled: true

@@ -1,0 +1,76 @@
+---
+# roles/ollama/tasks/main.yml
+# Installs Ollama and pulls LLM + embedding models. API server only.
+
+- name: Check if Ollama already installed
+  stat:
+    path: /usr/local/bin/ollama
+  register: ollama_bin
+
+- name: Install Ollama
+  when: not ollama_bin.stat.exists
+  shell: curl -fsSL https://ollama.com/install.sh | sh
+  args:
+    creates: /usr/local/bin/ollama
+
+- name: Create Ollama models directory
+  file:
+    path:  /opt/ollama/models
+    state: directory
+    owner: "{{ app_user }}"
+    mode:  "0755"
+
+- name: Install Ollama systemd service
+  copy:
+    dest: /etc/systemd/system/ollama.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Ollama LLM Service
+      After=network.target
+
+      [Service]
+      Type=simple
+      User={{ app_user }}
+      ExecStart=/usr/local/bin/ollama serve
+      Restart=always
+      RestartSec=5
+      Environment=OLLAMA_HOST=0.0.0.0:{{ ollama_port }}
+      Environment=OLLAMA_MODELS=/opt/ollama/models
+      StandardOutput=append:{{ app_dir }}/logs/ollama.log
+      StandardError=append:{{ app_dir }}/logs/ollama.log
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Reload systemd and start Ollama
+  systemd:
+    name:          ollama
+    state:         started
+    enabled:       true
+    daemon_reload: true
+
+- name: Wait for Ollama API to be ready
+  uri:
+    url:    "http://localhost:{{ ollama_port }}/api/tags"
+    method: GET
+  register: ollama_health
+  retries:  15
+  delay:    5
+  until:    ollama_health.status == 200
+
+- name: Pull LLM model — {{ ollama_llm_model }}
+  command: /usr/local/bin/ollama pull {{ ollama_llm_model }}
+  become_user: "{{ app_user }}"
+  environment:
+    OLLAMA_HOST: "http://localhost:{{ ollama_port }}"
+  register: pull_llm
+  changed_when: "'already up to date' not in pull_llm.stdout"
+
+- name: Pull embedding model — {{ ollama_embed_model }}
+  command: /usr/local/bin/ollama pull {{ ollama_embed_model }}
+  become_user: "{{ app_user }}"
+  environment:
+    OLLAMA_HOST: "http://localhost:{{ ollama_port }}"
+  register: pull_embed
+  changed_when: "'already up to date' not in pull_embed.stdout"

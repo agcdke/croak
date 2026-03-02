@@ -1,0 +1,81 @@
+---
+# roles/app/tasks/main.yml
+# Writes .env and installs systemd services based on server_role.
+
+- name: Write .env file
+  template:
+    src:   env.j2
+    dest:  "{{ app_dir }}/.env"
+    owner: "{{ app_user }}"
+    mode:  "0640"
+
+# ── API server ────────────────────────────────────────────────────────────────
+
+- name: Install FastAPI systemd service
+  when: server_role == 'api'
+  template:
+    src:  fastapi.service.j2
+    dest: /etc/systemd/system/rag-api.service
+    mode: "0644"
+  notify: restart rag-api
+
+- name: Install FastMCP systemd service
+  when: server_role == 'api'
+  template:
+    src:  mcp.service.j2
+    dest: /etc/systemd/system/rag-mcp.service
+    mode: "0644"
+  notify: restart rag-mcp
+
+- name: Enable and start API services
+  when: server_role == 'api'
+  systemd:
+    name:          "{{ item }}"
+    state:         started
+    enabled:       true
+    daemon_reload: true
+  loop:
+    - rag-api
+    - rag-mcp
+
+# ── UI server ─────────────────────────────────────────────────────────────────
+
+- name: Install Streamlit systemd service
+  when: server_role == 'ui'
+  template:
+    src:  streamlit.service.j2
+    dest: /etc/systemd/system/rag-ui.service
+    mode: "0644"
+  notify: restart rag-ui
+
+- name: Enable and start UI service
+  when: server_role == 'ui'
+  systemd:
+    name:          rag-ui
+    state:         started
+    enabled:       true
+    daemon_reload: true
+
+# ── Health checks ─────────────────────────────────────────────────────────────
+
+- name: Wait for FastAPI to respond
+  when: server_role == 'api'
+  uri:
+    url:    "http://localhost:{{ api_port }}/health"
+    method: GET
+  register: api_health
+  retries:  12
+  delay:    5
+  until:    api_health.status == 200
+  ignore_errors: true
+
+- name: Wait for Streamlit to respond
+  when: server_role == 'ui'
+  uri:
+    url:    "http://localhost:{{ ui_port }}"
+    method: GET
+  register: ui_health
+  retries:  12
+  delay:    5
+  until:    ui_health.status == 200
+  ignore_errors: true

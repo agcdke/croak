@@ -1,0 +1,262 @@
+---
+# playbooks/provision.yml
+# Creates: SSH key pair, security groups, IAM role+profile, S3 bucket, 2 EC2 instances.
+# Run ONCE to bootstrap AWS infrastructure.
+#
+# Prerequisites:
+#   pip install boto3 botocore
+#   ansible-galaxy collection install amazon.aws
+#   export AWS_ACCESS_KEY_ID=...
+#   export AWS_SECRET_ACCESS_KEY=...
+#
+# Usage:
+#   ansible-playbook playbooks/provision.yml
+
+- name: Provision AWS Infrastructure
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+
+    # ── SSH Key Pair ─────────────────────────────────────────────────────────
+
+    - name: Create EC2 SSH key pair
+      amazon.aws.ec2_key:
+        name:   "{{ aws_key_name }}"
+        region: "{{ aws_region }}"
+      register: key_pair
+
+    - name: Save private key locally (only on first creation)
+      when: key_pair.changed
+      copy:
+        content: "{{ key_pair.key.private_key }}"
+        dest:    "~/.ssh/{{ aws_key_name }}.pem"
+        mode:    "0600"
+
+    - name: Show key saved message
+      when: key_pair.changed
+      debug:
+        msg: "SSH key saved to ~/.ssh/{{ aws_key_name }}.pem — back this up!"
+
+    # ── Security Groups ───────────────────────────────────────────────────────
+
+    - name: Create API server security group
+      amazon.aws.ec2_security_group:
+        name:        rag-chatbot-api-sg
+        description: "RAG Chatbot API — FastAPI + FastMCP + Ollama"
+        region:      "{{ aws_region }}"
+        rules:
+          - proto:     tcp
+            ports:     [22]
+            cidr_ip:   0.0.0.0/0
+            rule_desc: SSH
+          - proto:     tcp
+            ports:     ["{{ api_port }}"]
+            cidr_ip:   0.0.0.0/0
+            rule_desc: FastAPI
+          - proto:     tcp
+            ports:     ["{{ mcp_port }}"]
+            cidr_ip:   0.0.0.0/0
+            rule_desc: FastMCP
+        rules_egress:
+          - proto:   all
+            cidr_ip: 0.0.0.0/0
+      register: api_sg
+
+    - name: Create UI server security group
+      amazon.aws.ec2_security_group:
+        name:        rag-chatbot-ui-sg
+        description: "RAG Chatbot UI — Streamlit + Nginx"
+        region:      "{{ aws_region }}"
+        rules:
+          - proto:     tcp
+            ports:     [22]
+            cidr_ip:   0.0.0.0/0
+            rule_desc: SSH
+          - proto:     tcp
+            ports:     [80, 443]
+            cidr_ip:   0.0.0.0/0
+            rule_desc: HTTP/HTTPS via Nginx
+          - proto:     tcp
+            ports:     ["{{ ui_port }}"]
+            cidr_ip:   0.0.0.0/0
+            rule_desc: Streamlit direct
+        rules_egress:
+          - proto:   all
+            cidr_ip: 0.0.0.0/0
+      register: ui_sg
+
+    # ── IAM Role + Instance Profile (for S3 access without keys) ─────────────
+
+    - name: Create IAM role for EC2 → S3
+      amazon.aws.iam_role:
+        name:        rag-chatbot-ec2-role
+        region:      "{{ aws_region }}"
+        description: EC2 role — S3 read/write for RAG chatbot
+        assume_role_policy_document: |
+          {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Principal": { "Service": "ec2.amazonaws.com" },
+              "Action": "sts:AssumeRole"
+            }]
+          }
+        state: present
+
+    - name: Attach S3 inline policy to role
+      amazon.aws.iam_policy:
+        iam_type:    role
+        iam_name:    rag-chatbot-ec2-role
+        policy_name: rag-chatbot-s3-rw
+        state:       present
+        policy_json: |
+          {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:DeleteObject",
+                "s3:ListBucket",
+                "s3:GetBucketLocation"
+              ],
+              "Resource": [
+                "arn:aws:s3:::{{ s3_bucket }}",
+                "arn:aws:s3:::{{ s3_bucket }}/*"
+              ]
+            }]
+          }
+
+    - name: Create EC2 instance profile
+      amazon.aws.iam_instance_profile:
+        name:   rag-chatbot-ec2-profile
+        role:   rag-chatbot-ec2-role
+        region: "{{ aws_region }}"
+        state:  present
+      register: instance_profile
+
+    # ── S3 Bucket ─────────────────────────────────────────────────────────────
+
+    - name: Create S3 bucket
+      amazon.aws.s3_bucket:
+        name:    "{{ s3_bucket }}"
+        region:  "{{ aws_region }}"
+        versioning: true
+        public_access:
+          block_public_acls:       true
+          block_public_policy:     true
+          ignore_public_acls:      true
+          restrict_public_buckets: true
+        state: present
+
+    - name: Add lifecycle rule — expire old ChromaDB snapshots after 30 days
+      amazon.aws.s3_lifecycle:
+        name:   "{{ s3_bucket }}"
+        region: "{{ aws_region }}"
+        rules:
+          - id:             expire-old-chroma-backups
+            prefix:         "{{ s3_chroma_prefix }}"
+            status:         enabled
+            expiration_days: 30
+
+    # ── EC2 Instances ─────────────────────────────────────────────────────────
+
+    - name: Launch API EC2 instance
+      amazon.aws.ec2_instance:
+        name:                 rag-chatbot-api
+        key_name:             "{{ aws_key_name }}"
+        instance_type:        "{{ api_instance_type }}"
+        image_id:             "{{ aws_ami }}"
+        region:               "{{ aws_region }}"
+        security_groups:      [rag-chatbot-api-sg]
+        iam_instance_profile: rag-chatbot-ec2-profile
+        volumes:
+          - device_name: /dev/sda1
+            ebs:
+              volume_size:           "{{ api_volume_size }}"
+              delete_on_termination: true
+              volume_type:           gp3
+        tags:
+          Name: rag-chatbot-api
+          Role: api
+          Project: rag-chatbot
+        wait:  true
+        state: running
+      register: api_instance
+
+    - name: Allocate Elastic IP for API server
+      amazon.aws.ec2_eip:
+        region:    "{{ aws_region }}"
+        device_id: "{{ api_instance.instances[0].instance_id }}"
+        in_vpc:    true
+        state:     present
+      register: api_eip
+
+    - name: Launch UI EC2 instance
+      amazon.aws.ec2_instance:
+        name:                 rag-chatbot-ui
+        key_name:             "{{ aws_key_name }}"
+        instance_type:        "{{ ui_instance_type }}"
+        image_id:             "{{ aws_ami }}"
+        region:               "{{ aws_region }}"
+        security_groups:      [rag-chatbot-ui-sg]
+        iam_instance_profile: rag-chatbot-ec2-profile
+        volumes:
+          - device_name: /dev/sda1
+            ebs:
+              volume_size:           "{{ ui_volume_size }}"
+              delete_on_termination: true
+              volume_type:           gp3
+        tags:
+          Name: rag-chatbot-ui
+          Role: ui
+          Project: rag-chatbot
+        wait:  true
+        state: running
+      register: ui_instance
+
+    - name: Allocate Elastic IP for UI server
+      amazon.aws.ec2_eip:
+        region:    "{{ aws_region }}"
+        device_id: "{{ ui_instance.instances[0].instance_id }}"
+        in_vpc:    true
+        state:     present
+      register: ui_eip
+
+    # ── Update inventory automatically ────────────────────────────────────────
+
+    - name: Write public IPs into inventory/hosts.yml
+      copy:
+        dest: inventory/hosts.yml
+        content: |
+          ---
+          all:
+            children:
+              api_servers:
+                hosts:
+                  api:
+                    ansible_host: {{ api_eip.public_ip }}
+                    ansible_user: ubuntu
+
+              ui_servers:
+                hosts:
+                  ui:
+                    ansible_host: {{ ui_eip.public_ip }}
+                    ansible_user: ubuntu
+
+    - name: Print summary
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════╗
+          ║  Infrastructure ready!                                   ║
+          ╠══════════════════════════════════════════════════════════╣
+          ║  API server IP : {{ api_eip.public_ip }}
+          ║  UI  server IP : {{ ui_eip.public_ip }}
+          ║  S3 bucket     : {{ s3_bucket }}
+          ╠══════════════════════════════════════════════════════════╣
+          ║  inventory/hosts.yml updated automatically.              ║
+          ║  Next: ansible-playbook playbooks/deploy.yml             ║
+          ╚══════════════════════════════════════════════════════════╝

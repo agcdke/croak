@@ -1,0 +1,34 @@
+---
+# playbooks/deploy.yml
+# Deploys the RAG chatbot to API and UI servers.
+# Run after provision.yml.
+#
+# Usage:
+#   ansible-playbook playbooks/deploy.yml               # both servers
+#   ansible-playbook playbooks/deploy.yml --limit api   # API only
+#   ansible-playbook playbooks/deploy.yml --limit ui    # UI only
+
+# ── API Server: FastAPI + FastMCP + Ollama ────────────────────────────────────
+- name: Deploy API server
+  hosts: api_servers
+  become: true
+  vars:
+    server_role: api
+  roles:
+    - common
+    - ollama
+    - s3_sync
+    - app
+    - nginx
+
+# ── UI Server: Streamlit ──────────────────────────────────────────────────────
+- name: Deploy UI server
+  hosts: ui_servers
+  become: true
+  vars:
+    server_role: ui
+  roles:
+    - common
+    - s3_sync
+    - app
+    - nginx

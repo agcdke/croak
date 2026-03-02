@@ -1,0 +1,50 @@
+---
+# ── AWS ────────────────────────────────────────────────────────────────────────
+aws_region:        us-east-1
+aws_key_name:      rag-chatbot-key
+# Ubuntu 22.04 LTS (us-east-1) — check latest AMI for your region:
+# aws ec2 describe-images --owners 099720109477 --filters "Name=name,Values=ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"
+aws_ami:           ami-0c02fb55956c7d316
+
+# API server: FastAPI + FastMCP + Ollama (needs RAM for Ollama models)
+# c5.2xlarge = 8 vCPU, 16 GB RAM (~$0.34/hr) — good for CPU-only Ollama
+# c5.4xlarge = 16 vCPU, 32 GB RAM (~$0.68/hr) — comfortable headroom
+# g4dn.xlarge = GPU (~$0.53/hr) — much faster inference if models support CUDA
+api_instance_type: c5.2xlarge
+api_volume_size:   60    # GB — Ollama models take ~10–20 GB
+
+# UI server: Streamlit only — lightweight
+ui_instance_type:  t3.medium
+ui_volume_size:    20    # GB
+
+# ── S3 ─────────────────────────────────────────────────────────────────────────
+# IMPORTANT: change this — S3 bucket names are globally unique across all AWS
+s3_bucket:         rag-chatbot-storage-YOURNAME
+s3_uploads_prefix: uploads/
+s3_chroma_prefix:  chroma_backup/
+s3_region:         "{{ aws_region }}"
+
+# ── App ────────────────────────────────────────────────────────────────────────
+# Replace with your actual repo URL
+app_repo:          https://github.com/YOUR_USERNAME/pdf-turtle-chatbot.git
+app_branch:        main
+app_dir:           /opt/rag-chatbot
+app_user:          ubuntu
+app_venv:          /opt/rag-chatbot/venv
+
+# Ollama models
+ollama_llm_model:    llama3.2
+ollama_embed_model:  nomic-embed-text
+ollama_port:         11434
+
+# Service ports
+api_port:  8000
+mcp_port:  8001
+ui_port:   8501
+
+# ── Secrets ────────────────────────────────────────────────────────────────────
+# These are loaded from ansible-vault encrypted file: group_vars/vault.yml
+# Run: ansible-vault create group_vars/vault.yml
+# Then add these keys:
+#   vault_aws_access_key: AKIAIOSFODNN7EXAMPLE
+#   vault_aws_secret_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY

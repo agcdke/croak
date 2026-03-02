@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# scripts/start_ui.sh — Start the Streamlit chatbot UI
+set -e
+
+echo "🎨 Starting Streamlit UI..."
+cd "$(dirname "$0")/.."
+streamlit run scripts/demo.py \
+    --server.port 8501 \
+    --server.address 0.0.0.0 \
+    --theme.base dark \
+    --theme.primaryColor "#6366f1" \
+    --theme.backgroundColor "#0f1117" \
+    --theme.secondaryBackgroundColor "#1a1d27" \
+    --theme.textColor "#e2e8f0"

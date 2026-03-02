@@ -1,0 +1,22 @@
+[Unit]
+Description=RAG Chatbot — Streamlit UI
+After=network.target
+
+[Service]
+Type=simple
+User={{ app_user }}
+WorkingDirectory={{ app_dir }}
+EnvironmentFile={{ app_dir }}/.env
+ExecStart={{ app_venv }}/bin/streamlit run scripts/demo.py \
+    --server.port {{ ui_port }} \
+    --server.address 0.0.0.0 \
+    --server.headless true \
+    --server.fileWatcherType none \
+    --browser.gatherUsageStats false
+Restart=always
+RestartSec=5
+StandardOutput=append:{{ app_dir }}/logs/ui.log
+StandardError=append:{{ app_dir }}/logs/ui.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,40 @@
+#!/bin/bash
+# /usr/local/bin/rag-s3-backup.sh
+# Syncs uploads/ or snapshots chroma_db/ to S3.
+# Usage: rag-s3-backup.sh [uploads|chroma]
+
+set -euo pipefail
+
+APP_DIR="{{ app_dir }}"
+BUCKET="{{ s3_bucket }}"
+REGION="{{ s3_region }}"
+TS=$(date +%Y%m%d-%H%M%S)
+TARGET="${1:-uploads}"
+
+case "$TARGET" in
+  uploads)
+    echo "[$TS] Syncing uploads/ → s3://$BUCKET/{{ s3_uploads_prefix }}"
+    aws s3 sync "$APP_DIR/data/uploads/" \
+      "s3://$BUCKET/{{ s3_uploads_prefix }}" \
+      --region "$REGION" --delete --no-progress
+    echo "[$TS] uploads sync done"
+    ;;
+
+  chroma)
+    echo "[$TS] Backing up chroma_db/ → s3://$BUCKET/{{ s3_chroma_prefix }}"
+    # Timestamped snapshot (kept 30 days by lifecycle rule)
+    aws s3 sync "$APP_DIR/data/chroma_db/" \
+      "s3://$BUCKET/{{ s3_chroma_prefix }}$TS/" \
+      --region "$REGION" --no-progress
+    # Overwrite 'latest' pointer for restore on next deploy
+    aws s3 sync "$APP_DIR/data/chroma_db/" \
+      "s3://$BUCKET/{{ s3_chroma_prefix }}latest/" \
+      --region "$REGION" --delete --no-progress
+    echo "[$TS] chroma backup done"
+    ;;
+
+  *)
+    echo "Usage: $0 [uploads|chroma]"
+    exit 1
+    ;;
+esac

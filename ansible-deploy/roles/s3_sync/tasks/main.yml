@@ -1,0 +1,54 @@
+---
+# roles/s3_sync/tasks/main.yml
+# Restores data from S3 on deploy; installs backup cron jobs.
+
+- name: Restore uploads from S3
+  shell: |
+    aws s3 sync s3://{{ s3_bucket }}/{{ s3_uploads_prefix }} \
+      {{ app_dir }}/data/uploads/ \
+      --region {{ s3_region }} --no-progress
+  become_user: "{{ app_user }}"
+  register:    restore_uploads
+  changed_when: restore_uploads.stdout != ""
+  ignore_errors: true   # first deploy — bucket may be empty
+
+- name: Restore ChromaDB from S3
+  shell: |
+    aws s3 sync s3://{{ s3_bucket }}/{{ s3_chroma_prefix }}latest/ \
+      {{ app_dir }}/data/chroma_db/ \
+      --region {{ s3_region }} --no-progress
+  become_user: "{{ app_user }}"
+  register:    restore_chroma
+  changed_when: restore_chroma.stdout != ""
+  ignore_errors: true
+
+- name: Fix permissions on restored data
+  file:
+    path:    "{{ item }}"
+    state:   directory
+    owner:   "{{ app_user }}"
+    mode:    "0777"
+    recurse: true
+  loop:
+    - "{{ app_dir }}/data/uploads"
+    - "{{ app_dir }}/data/chroma_db"
+
+- name: Deploy S3 backup script
+  template:
+    src:  s3_backup.sh.j2
+    dest: /usr/local/bin/rag-s3-backup.sh
+    mode: "0755"
+
+- name: Cron — sync uploads to S3 every 5 minutes
+  cron:
+    name: "rag uploads → S3"
+    user: "{{ app_user }}"
+    minute: "*/5"
+    job: "/usr/local/bin/rag-s3-backup.sh uploads >> {{ app_dir }}/logs/s3_backup.log 2>&1"
+
+- name: Cron — backup ChromaDB to S3 every 15 minutes
+  cron:
+    name: "rag chroma → S3"
+    user: "{{ app_user }}"
+    minute: "*/15"
+    job: "/usr/local/bin/rag-s3-backup.sh chroma >> {{ app_dir }}/logs/s3_backup.log 2>&1"

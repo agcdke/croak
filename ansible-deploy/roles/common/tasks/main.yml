@@ -1,0 +1,80 @@
+---
+# roles/common/tasks/main.yml
+# System packages, Python env, app clone, data directories.
+
+- name: Update apt cache
+  apt:
+    update_cache:     true
+    cache_valid_time: 3600
+
+- name: Install system packages
+  apt:
+    name:
+      - python3.11
+      - python3.11-venv
+      - python3-pip
+      - python3-dev
+      - build-essential
+      - git
+      - curl
+      - wget
+      - nginx
+      - awscli
+      - htop
+      - vim
+    state: present
+
+- name: Ensure app directory exists
+  file:
+    path:  "{{ app_dir }}"
+    state: directory
+    owner: "{{ app_user }}"
+    group: "{{ app_user }}"
+    mode:  "0755"
+
+- name: Clone or update app repo
+  git:
+    repo:    "{{ app_repo }}"
+    dest:    "{{ app_dir }}"
+    version: "{{ app_branch }}"
+    force:   true
+  become_user: "{{ app_user }}"
+
+- name: Create Python virtual environment
+  command: python3.11 -m venv {{ app_venv }}
+  args:
+    creates: "{{ app_venv }}/bin/python"
+  become_user: "{{ app_user }}"
+
+- name: Upgrade pip
+  pip:
+    name:       pip
+    state:      latest
+    virtualenv: "{{ app_venv }}"
+  become_user: "{{ app_user }}"
+
+- name: Install app Python requirements
+  pip:
+    requirements: "{{ app_dir }}/requirements.txt"
+    virtualenv:   "{{ app_venv }}"
+    extra_args:   "--no-cache-dir"
+  become_user: "{{ app_user }}"
+
+- name: Install boto3 for S3 integration
+  pip:
+    name:       [boto3, botocore]
+    virtualenv: "{{ app_venv }}"
+  become_user: "{{ app_user }}"
+
+- name: Create data and log directories with open permissions
+  file:
+    path:  "{{ item }}"
+    state: directory
+    owner: "{{ app_user }}"
+    group: "{{ app_user }}"
+    mode:  "0777"
+  loop:
+    - "{{ app_dir }}/data"
+    - "{{ app_dir }}/data/uploads"
+    - "{{ app_dir }}/data/chroma_db"
+    - "{{ app_dir }}/logs"
