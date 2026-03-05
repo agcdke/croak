@@ -1,6 +1,6 @@
 # 📄🐢 PDF & Turtle RDF Chatbot
 
-A fully local, free RAG (Retrieval-Augmented Generation) chatbot that lets you chat with **PDF documents** and **Turtle RDF (`.ttl`) files** using:
+Croak - if a FROG (FROm Ground) communicates with a fully local, free RAG (Retrieval-Augmented Generation) chatbot that lets FROG chat with **PDF documents** and **Turtle RDF (`.ttl`) files** using:
 
 | Component | Library | Cost |
 |-----------|---------|------|
