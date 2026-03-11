@@ -196,146 +196,373 @@ class PDFLoader:
 
 class TurtleLoader:
     """
-    Loads Turtle RDF (.ttl) files and converts triples to human-readable
-    text Documents suitable for embedding.
+    Domain-aware Turtle RDF loader.
 
-    Key fix — why Turtle retrieval previously failed:
-      Raw URIs like "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" are
-      opaque to embedding models. nomic-embed-text and similar models encode
-      them as near-random vectors with no semantic meaning, so similarity
-      search never finds relevant chunks.
+    Detects entity types in the graph and applies specialised chunking
+    strategies per type so embedding quality is maximised for each domain.
 
-    Solution — two-stage conversion:
-      1. _uri_to_label()  strips namespace prefixes from URIs and converts
-         CamelCase / snake_case local names to plain English words.
-         e.g. "http://schema.org/Person"  →  "Person"
-              "http://schema.org/birthDate" →  "birth date"
-      2. _subject_to_sentences() groups all triples about the same subject
-         into one natural-language paragraph:
-         "Person John Smith. Has birth date 1990-01-01. Has email john@x.com."
-         This is far more embeddable than 50 disconnected raw triples.
+    Supported entity types (auto-detected from graph content):
+    ┌─────────────────────────┬────────────────────────────────────────────┐
+    │ Type                    │ Strategy                                   │
+    ├─────────────────────────┼────────────────────────────────────────────┤
+    │ ex:InspectionReport     │ One structured prose paragraph per report  │
+    │ (fred_synth_kg.ttl)     │ with all fields: date, product, supplier,  │
+    │                         │ defect%, rejected, origin country          │
+    ├─────────────────────────┼────────────────────────────────────────────┤
+    │ skos:Concept (AGROVOC)  │ One chunk per concept: preferred English   │
+    │                         │ label + all synonyms + hierarchy links     │
+    ├─────────────────────────┼────────────────────────────────────────────┤
+    │ Generic entity          │ Entity-centric chunks of ≤20 sentences,   │
+    │ (any other TTL)         │ each prefixed with "Facts about X:"        │
+    └─────────────────────────┴────────────────────────────────────────────┘
 
-    Chunking:
-      Groups sentences by subject (entity-centric chunks) rather than fixed
-      50-triple windows. Each chunk describes one entity completely, so the
-      retriever returns coherent facts rather than arbitrary slices.
+    All types also register the file in the SPARQL engine for exact
+    structured queries that bypass RAG.
     """
+
+    # Known namespace prefixes for readable label generation
+    NS_PREFIXES = {
+        "http://www.w3.org/2004/02/skos/core#":            "skos:",
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#":     "rdf:",
+        "http://www.w3.org/2000/01/rdf-schema#":           "rdfs:",
+        "http://purl.org/dc/terms/":                       "dcterms:",
+        "https://example.org/kg/":                         "ex:",
+        "http://aims.fao.org/aos/agrovoc/":                "agrovoc:",
+        "http://publications.europa.eu/resource/authority/country/": "",  # just use code
+    }
+
+    # EU country code → full name (for readable inspection report chunks)
+    EU_COUNTRY_CODES = {
+        "AUT":"Austria","BEL":"Belgium","BGR":"Bulgaria","HRV":"Croatia",
+        "CYP":"Cyprus","CZE":"Czechia","DNK":"Denmark","EST":"Estonia",
+        "FIN":"Finland","FRA":"France","DEU":"Germany","GRC":"Greece",
+        "HUN":"Hungary","IRL":"Ireland","ITA":"Italy","LVA":"Latvia",
+        "LTU":"Lithuania","LUX":"Luxembourg","MLT":"Malta","NLD":"Netherlands",
+        "POL":"Poland","PRT":"Portugal","ROU":"Romania","SVK":"Slovakia",
+        "SVN":"Slovenia","ESP":"Spain","SWE":"Sweden","GBR":"United Kingdom",
+        "USA":"United States","CAN":"Canada","BRA":"Brazil","ARG":"Argentina",
+        "MAR":"Morocco","ZAF":"South Africa","EGY":"Egypt","TUR":"Turkey",
+        "ISR":"Israel","CHN":"China","JPN":"Japan","IND":"India",
+        "MEX":"Mexico","COL":"Colombia","PER":"Peru","CHL":"Chile",
+        "KEN":"Kenya","ETH":"Ethiopia","SEN":"Senegal","GHA":"Ghana",
+    }
 
     def __init__(self, file_path: str):
         self.file_path = file_path
         self.file_name = Path(file_path).name
+        self._graph: Optional[Graph] = None
 
-    # ── URI → readable label ───────────────────────────────────────────────────
+    # ── URI helpers ────────────────────────────────────────────────────────────
 
     @staticmethod
     def _uri_to_label(uri_ref) -> str:
-        """
-        Convert a URI or literal to a readable English label.
-
-        URIRef  →  local name with CamelCase / snake_case split into words
-        Literal →  its string value directly
-        BNode   →  "entity"
-        """
+        """URI/Literal → readable English string."""
         from rdflib import URIRef, Literal, BNode
-
         if isinstance(uri_ref, Literal):
             return str(uri_ref).strip()
-
         if isinstance(uri_ref, BNode):
             return "entity"
-
-        # URIRef: take the fragment (#name) or last path segment (/name)
         s = str(uri_ref)
-        if "#" in s:
-            local = s.rsplit("#", 1)[-1]
-        elif "/" in s:
-            local = s.rsplit("/", 1)[-1]
-        else:
-            local = s
-
-        # CamelCase → "Camel Case"
+        local = s.rsplit("#", 1)[-1] if "#" in s else s.rsplit("/", 1)[-1]
         local = re.sub(r"([a-z])([A-Z])", r"\1 \2", local)
-        # snake_case / kebab-case → spaces
         local = re.sub(r"[_\-]+", " ", local)
         return local.strip() or s
 
-    def _triple_to_sentence(self, s, p, o) -> str:
+    def _country_label(self, uri: str) -> str:
+        """Convert EU country authority URI to full country name."""
+        code = uri.rsplit("/", 1)[-1]
+        return self.EU_COUNTRY_CODES.get(code, code)
+
+    def _pref_label_en(self, g: Graph, uri) -> str:
+        """Get the English prefLabel for a URI, falling back to URI local name."""
+        from rdflib import URIRef, Literal
+        from rdflib.namespace import SKOS
+        for _, _, o in g.triples((uri, SKOS.prefLabel, None)):
+            if isinstance(o, Literal) and o.language == "en" and str(o).strip():
+                return str(o).strip()
+        return self._uri_to_label(uri)
+
+    # ── Domain detector ────────────────────────────────────────────────────────
+
+    def _detect_domains(self, g: Graph) -> set:
+        """Return set of domain names found in graph: 'inspection', 'skos', 'generic'."""
+        from rdflib import URIRef
+        from rdflib.namespace import RDF
+        domains = set()
+        inspection_type = URIRef("https://example.org/kg/InspectionReport")
+        skos_concept    = URIRef("http://www.w3.org/2004/02/skos/core#Concept")
+        for _, _, o in g.triples((None, RDF.type, None)):
+            if o == inspection_type:
+                domains.add("inspection")
+            elif o == skos_concept:
+                domains.add("skos")
+        if not domains:
+            domains.add("generic")
+        return domains
+
+    # ── Chunking strategies ────────────────────────────────────────────────────
+
+    def _chunk_inspection_reports(self, g: Graph) -> List[Document]:
         """
-        Convert one (subject, predicate, object) triple to a readable sentence.
-        e.g. "John Smith  has birth date  1990-01-01."
+        One Document per InspectionReport with all fields as a readable paragraph.
+
+        Example output:
+          Inspection Report 1000 | Date: 2023-02-16 | Product: Celery
+          Supplier: Camposeven SAT | Packer: camposeven | Origin: Spain
+          Batch: 308253 | Product ID: 58812 | Rejected: Yes | Borderline: No
+          Defect: 74% — Minimum quality requirement "whole" not met
+          Detail: with mechanical damage on stalks
         """
-        subj  = self._uri_to_label(s)
-        pred  = self._uri_to_label(p).lower()
-        obj   = self._uri_to_label(o)
+        from rdflib import URIRef, Literal
+        from rdflib.namespace import RDF, RDFS, SKOS
 
-        # Prettify common RDF predicates
-        pred = (pred
-                .replace("rdf type", "is a")
-                .replace("type", "is a")
-                .replace("label", "is called")
-                .replace("comment", "is described as")
-                .replace("subclass of", "is a subclass of")
-                .replace("domain", "applies to")
-                .replace("range", "has values of type"))
+        EX       = "https://example.org/kg/"
+        DCTERMS  = "http://purl.org/dc/terms/"
+        REPORT_T = URIRef(f"{EX}InspectionReport")
 
-        return f"{subj} {pred} {obj}."
+        # Build prefLabel lookup for AGROVOC product URIs
+        product_labels: dict = {}
+        for s, _, o in g.triples((None, SKOS.prefLabel, None)):
+            if isinstance(o, Literal) and o.language == "en" and str(o).strip():
+                uri = str(s)
+                if uri not in product_labels:
+                    product_labels[uri] = str(o).strip()
 
-    def load(self) -> Tuple[List[Document], List[Document]]:
-        logger.info(f"Loading Turtle file: {self.file_path}")
-
-        from rdflib import URIRef, BNode
-        from collections import defaultdict
-
-        g = Graph()
-        g.parse(self.file_path, format="turtle")
-
-        # ── Group triples by subject (entity-centric chunking) ─────────────
-        subject_sentences: dict = defaultdict(list)
-        for s, p, o in g:
-            sentence = remove_unicode(self._triple_to_sentence(s, p, o))
-            subject_sentences[str(s)].append(sentence)
-
-        # ── Build one Document per subject ─────────────────────────────────
-        # If a subject has many predicates, split into chunks of 20 sentences
-        # so no single chunk exceeds the embedding model's sweet spot.
-        SENTENCES_PER_CHUNK = 20
         docs: List[Document] = []
         base_meta = {
             "source":      self.file_path,
             "source_type": "turtle",
             "file_name":   self.file_name,
             "chunk_type":  "text",
+            "entity_type": "InspectionReport",
         }
 
+        def _val(g, subj, pred_local, ns=EX):
+            """Get first string value for a predicate."""
+            pred = URIRef(f"{ns}{pred_local}")
+            for _, _, o in g.triples((subj, pred, None)):
+                return str(o).strip()
+            return ""
+
+        for report_uri, _, _ in g.triples((None, RDF.type, REPORT_T)):
+            report_id  = str(report_uri).rsplit("/", 1)[-1]
+            label      = _val(g, report_uri, "label",   ns="http://www.w3.org/2000/01/rdf-schema#")
+            date       = _val(g, report_uri, "date",    ns=DCTERMS)
+            subject    = _val(g, report_uri, "subject", ns=DCTERMS)
+
+            # Product: resolve AGROVOC URI to English label
+            product_uri_node = next(
+                (o for _, _, o in g.triples((report_uri, URIRef(f"{EX}hasProduct"), None))), None
+            )
+            product = ""
+            if product_uri_node:
+                product = product_labels.get(str(product_uri_node), "") or subject
+
+            # Country: resolve EU authority URI to country name
+            country_node = next(
+                (o for _, _, o in g.triples((report_uri, URIRef(f"{EX}originCountry"), None))), None
+            )
+            country = self._country_label(str(country_node)) if country_node else ""
+
+            supplier      = _val(g, report_uri, "supplierName")
+            packer        = _val(g, report_uri, "packerName")
+            batch         = _val(g, report_uri, "batchNumber")
+            product_id    = _val(g, report_uri, "productId")
+            rejected_raw  = _val(g, report_uri, "rejected")
+            borderline_raw= _val(g, report_uri, "borderline")
+            defect_pct    = _val(g, report_uri, "defectPercentageText")
+            defect_pct_num= _val(g, report_uri, "defectPercentage")
+            description   = _val(g, report_uri, "description")
+            detail        = _val(g, report_uri, "detail")
+            additional    = _val(g, report_uri, "additionalInfo")
+            exact_desc    = _val(g, report_uri, "exactProductDescription")
+            code          = _val(g, report_uri, "code")
+
+            rejected   = "Yes" if rejected_raw.lower() == "true" else "No"
+            borderline = "Yes" if borderline_raw.lower() == "true" else "No"
+
+            # Build readable paragraph — every non-empty field included
+            lines = [
+                f"Inspection Report {report_id}",
+                f"Date: {date}" if date else "",
+                f"Product: {product or subject}" if (product or subject) else "",
+                f"Exact product description: {exact_desc}" if exact_desc else "",
+                f"Supplier: {supplier}" if supplier else "",
+                f"Packer: {packer}" if packer else "",
+                f"Origin country: {country}" if country else "",
+                f"Batch number: {batch}" if batch else "",
+                f"Product ID: {product_id}" if product_id else "",
+                f"Code: {code}" if code else "",
+                f"Rejected: {rejected}",
+                f"Borderline: {borderline}",
+                f"Defect percentage: {defect_pct} ({defect_pct_num})" if defect_pct else "",
+                f"Description: {description}" if description else "",
+                f"Detail: {detail}" if detail else "",
+                f"Additional info: {additional}" if additional else "",
+            ]
+            content = "\n".join(remove_unicode(l) for l in lines if l)
+
+            docs.append(Document(
+                page_content=content,
+                metadata={
+                    **base_meta,
+                    "report_id":   report_id,
+                    "date":        date,
+                    "product":     product or subject,
+                    "supplier":    supplier,
+                    "country":     country,
+                    "rejected":    rejected,
+                },
+            ))
+
+        logger.info(f"  Inspection reports chunked: {len(docs)}")
+        return docs
+
+    def _chunk_skos_concepts(self, g: Graph) -> List[Document]:
+        """
+        One Document per skos:Concept with English labels + hierarchy.
+
+        Example output:
+          SKOS Concept: garlic
+          Preferred label (en): garlic
+          Also known as: garlic mix, Garlic specialties, Al ajillo
+          Broader concept: alliums
+        """
+        from rdflib import URIRef, Literal
+        from rdflib.namespace import RDF, SKOS
+
+        SKOS_CONCEPT = URIRef("http://www.w3.org/2004/02/skos/core#Concept")
+        docs: List[Document] = []
+        base_meta = {
+            "source":      self.file_path,
+            "source_type": "turtle",
+            "file_name":   self.file_name,
+            "chunk_type":  "text",
+            "entity_type": "SKOSConcept",
+        }
+
+        for concept_uri, _, _ in g.triples((None, RDF.type, SKOS_CONCEPT)):
+            # Collect all English preferred labels
+            en_pref = [
+                str(o) for _, _, o in g.triples((concept_uri, SKOS.prefLabel, None))
+                if isinstance(o, Literal) and o.language == "en" and str(o).strip()
+            ]
+            if not en_pref:
+                continue   # skip concepts with no English label
+
+            # Alt labels (synonyms) in English
+            en_alt = [
+                str(o) for _, _, o in g.triples((concept_uri, SKOS.altLabel, None))
+                if isinstance(o, Literal) and o.language == "en" and str(o).strip()
+            ]
+
+            # Broader/narrower/related — resolve to English labels
+            broader = [
+                self._pref_label_en(g, o)
+                for _, _, o in g.triples((concept_uri, SKOS.broader, None))
+            ]
+            narrower = [
+                self._pref_label_en(g, o)
+                for _, _, o in g.triples((concept_uri, SKOS.narrower, None))
+            ]
+            related = [
+                self._pref_label_en(g, o)
+                for _, _, o in g.triples((concept_uri, SKOS.related, None))
+            ]
+
+            primary = en_pref[0]
+            lines = [f"SKOS Concept: {primary}"]
+            if len(en_pref) > 1:
+                lines.append(f"Preferred labels: {', '.join(en_pref)}")
+            else:
+                lines.append(f"Preferred label: {primary}")
+            if en_alt:
+                lines.append(f"Also known as: {', '.join(en_alt)}")
+            if broader:
+                lines.append(f"Broader concept: {', '.join(broader)}")
+            if narrower:
+                lines.append(f"Narrower concepts: {', '.join(narrower)}")
+            if related:
+                lines.append(f"Related concepts: {', '.join(related)}")
+
+            content = remove_unicode("\n".join(lines))
+            docs.append(Document(
+                page_content=content,
+                metadata={
+                    **base_meta,
+                    "subject":     primary,
+                    "subject_uri": str(concept_uri),
+                },
+            ))
+
+        logger.info(f"  SKOS concepts chunked: {len(docs)}")
+        return docs
+
+    def _chunk_generic(self, g: Graph) -> List[Document]:
+        """Entity-centric chunks for any TTL that doesn't match a known domain."""
+        from rdflib import URIRef, BNode
+        from collections import defaultdict
+
+        subject_sentences: dict = defaultdict(list)
+        for s, p, o in g:
+            subj = self._uri_to_label(s)
+            pred = self._uri_to_label(p).lower()
+            obj  = self._uri_to_label(o)
+            pred = pred.replace("rdf type", "is a").replace("type", "is a")
+            subject_sentences[str(s)].append(remove_unicode(f"{subj} {pred} {obj}."))
+
+        CHUNK = 20
+        docs: List[Document] = []
+        base_meta = {
+            "source":      self.file_path,
+            "source_type": "turtle",
+            "file_name":   self.file_name,
+            "chunk_type":  "text",
+            "entity_type": "generic",
+        }
         for subj_uri, sentences in subject_sentences.items():
-            subj_label = self._uri_to_label(
+            label = self._uri_to_label(
                 URIRef(subj_uri) if subj_uri.startswith("http") else BNode(subj_uri)
             )
-            for i in range(0, len(sentences), SENTENCES_PER_CHUNK):
-                chunk_sentences = sentences[i: i + SENTENCES_PER_CHUNK]
-                # Header line gives the embedding model clear subject context
-                header  = f"Facts about {subj_label}:"
-                content = header + "\n" + " ".join(chunk_sentences)
-                docs.append(
-                    Document(
-                        page_content=content,
-                        metadata={
-                            **base_meta,
-                            "subject":       subj_label,
-                            "subject_uri":   subj_uri,
-                            "sentence_range": f"{i}-{i + len(chunk_sentences)}",
-                        },
-                    )
-                )
+            for i in range(0, len(sentences), CHUNK):
+                chunk = sentences[i: i + CHUNK]
+                docs.append(Document(
+                    page_content=f"Facts about {label}:\n" + " ".join(chunk),
+                    metadata={**base_meta, "subject": label, "subject_uri": subj_uri},
+                ))
 
-        total_triples = sum(len(v) for v in subject_sentences.values())
+        logger.info(f"  Generic entity chunks: {len(docs)}")
+        return docs
+
+    # ── Main load entry point ──────────────────────────────────────────────────
+
+    def load(self) -> Tuple[List[Document], List[Document]]:
+        logger.info(f"Loading Turtle file: {self.file_path}")
+
+        g = Graph()
+        g.parse(self.file_path, format="turtle")
+        logger.info(f"  Graph parsed: {len(g)} triples")
+
+        domains = self._detect_domains(g)
+        logger.info(f"  Detected domains: {domains}")
+
+        docs: List[Document] = []
+
+        if "inspection" in domains:
+            docs.extend(self._chunk_inspection_reports(g))
+
+        if "skos" in domains:
+            docs.extend(self._chunk_skos_concepts(g))
+
+        if "generic" in domains:
+            docs.extend(self._chunk_generic(g))
+
         logger.info(
-            f"TTL loaded — {total_triples} triples → "
-            f"{len(docs)} entity chunks from '{self.file_name}'"
+            f"TTL loaded — {len(g)} triples → {len(docs)} chunks "
+            f"from '{self.file_name}' (domains: {domains})"
         )
 
-        # Register this file in the SPARQL engine so it can answer
-        # structured queries directly on the graph (bypasses RAG embedding)
+        # Register in SPARQL engine for exact structured queries
         try:
             from src.rag.sparql_engine import get_sparql_engine
             get_sparql_engine(self.file_path)

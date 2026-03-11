@@ -43,32 +43,85 @@ from src.config import settings
 
 # ── SKOS namespace context given to LLM when generating SPARQL ─────────────────
 SCHEMA_CONTEXT = """
-You are querying an AGROVOC SKOS thesaurus stored as an RDF graph.
+You are querying an RDF knowledge graph stored in rdflib.
 
-PREFIXES (always include these in every SPARQL query):
-  PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
-  PREFIX dct:  <http://purl.org/dc/terms/>
-  PREFIX rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIXES (always include ALL of these):
+  PREFIX ex:      <https://example.org/kg/>
+  PREFIX skos:    <http://www.w3.org/2004/02/skos/core#>
+  PREFIX dct:     <http://purl.org/dc/terms/>
+  PREFIX rdf:     <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+  PREFIX rdfs:    <http://www.w3.org/2000/01/rdf-schema#>
+  PREFIX xsd:     <http://www.w3.org/2001/XMLSchema#>
+  PREFIX country: <http://publications.europa.eu/resource/authority/country/>
 
-KEY PREDICATES:
-  skos:prefLabel    — preferred label (use FILTER(lang(?label)="en") for English)
-  skos:altLabel     — alternative/synonym label
-  skos:broader      — broader (parent) concept
-  skos:narrower     — narrower (child) concept
-  skos:related      — related concept
-  skos:definition   — definition URI (not literal text in this dataset)
-  skos:inScheme     — concept belongs to a scheme
-  skos:Concept      — the type of all concepts
-  dct:created       — creation date
-  dct:modified      — last modified date
+ENTITY TYPES:
+  ex:InspectionReport  — food quality inspection records (1300+ instances)
+  skos:Concept         — AGROVOC food/agriculture concepts + EU country codes
+
+INSPECTION REPORT PROPERTIES (all on ex:InspectionReport instances):
+  rdfs:label           — e.g. "Inspection report 1000"
+  dct:date             — date as xsd:date, e.g. "2023-02-16"^^xsd:date
+  dct:subject          — product name as plain string, e.g. "Celery"
+  ex:batchNumber       — batch number string
+  ex:borderline        — boolean (true/false)
+  ex:code              — inspection code string
+  ex:defectPercentage  — decimal 0–1, e.g. 0.74
+  ex:defectPercentageText — string, e.g. "74%"
+  ex:description       — defect description string
+  ex:detail            — detail string
+  ex:additionalInfo    — optional additional information
+  ex:exactProductDescription — optional product packaging description
+  ex:hasProduct        — URI → AGROVOC skos:Concept (product)
+  ex:originCountry     — URI → EU country authority (e.g. country:ESP)
+  ex:packerName        — packer name string
+  ex:productId         — product ID string
+  ex:rejected          — boolean (true/false)
+  ex:supplierName      — supplier name string
+
+SKOS CONCEPT PROPERTIES:
+  skos:prefLabel       — preferred label (language-tagged: "garlic"@en)
+  skos:altLabel        — synonym label
+  skos:broader         — broader concept URI
+  skos:narrower        — narrower concept URI
+  skos:related         — related concept URI
 
 IMPORTANT RULES:
-  1. All concepts are URIs like <http://aims.fao.org/aos/agrovoc/c_XXXXX>
-  2. Labels are language-tagged literals: "turbidimetry"@en
-  3. Always use FILTER(lang(?label) = "en") to get English labels
-  4. For broader/narrower, JOIN on prefLabel to get readable names
-  5. Use OPTIONAL for fields that may not exist on every concept
-  6. Output ONLY the SPARQL query, no explanation, no markdown fences
+  1. Report URIs look like: <https://example.org/kg/report/1000>
+  2. Country URIs look like: <http://publications.europa.eu/resource/authority/country/ESP>
+  3. For dates use: FILTER(?date >= "2023-01-01"^^xsd:date)
+  4. For booleans use: FILTER(?rejected = true)
+  5. For text search use: FILTER(CONTAINS(LCASE(STR(?val)), "celery"))
+  6. Always use OPTIONAL for fields that may be absent
+  7. Always use LIMIT (e.g. LIMIT 20) to avoid huge result sets
+  8. For product labels: JOIN ex:hasProduct → skos:prefLabel with FILTER(lang(?label)="en")
+  9. Output ONLY the SPARQL query, no explanation, no markdown, no fences
+
+EXAMPLE QUERIES:
+
+# All rejected reports for Spain:
+SELECT ?report ?date ?product WHERE {
+  ?report a ex:InspectionReport ;
+          ex:rejected true ;
+          ex:originCountry country:ESP ;
+          dct:date ?date ;
+          dct:subject ?product .
+} ORDER BY DESC(?date) LIMIT 20
+
+# Reports with defect > 50%:
+SELECT ?report ?product ?defect WHERE {
+  ?report a ex:InspectionReport ;
+          dct:subject ?product ;
+          ex:defectPercentage ?defect .
+  FILTER(?defect > 0.5)
+} ORDER BY DESC(?defect) LIMIT 20
+
+# Find product concept labels:
+SELECT ?label WHERE {
+  ?concept a skos:Concept ;
+           skos:prefLabel ?label .
+  FILTER(lang(?label) = "en")
+  FILTER(CONTAINS(LCASE(STR(?label)), "garlic"))
+}
 """
 
 
@@ -121,9 +174,9 @@ class SPARQLEngine:
 
     def nl_to_sparql(self, question: str) -> str:
         """Use the LLM to translate a natural language question to SPARQL."""
-        from src.rag.llm import get_llm
+        from src.rag.llm import get_sparql_llm
 
-        llm = get_llm()
+        llm = get_sparql_llm()
         prompt = (
             f"{SCHEMA_CONTEXT}\n\n"
             f"Translate this question to a SPARQL SELECT query:\n"
@@ -140,9 +193,9 @@ class SPARQLEngine:
 
     def results_to_answer(self, question: str, sparql: str, rows: list[dict]) -> str:
         """Use the LLM to turn raw SPARQL results into a readable answer."""
-        from src.rag.llm import get_llm
+        from src.rag.llm import get_sparql_llm
 
-        llm = get_llm()
+        llm = get_sparql_llm()
 
         if not rows:
             results_text = "No results found."

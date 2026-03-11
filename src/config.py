@@ -11,7 +11,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 class Settings(BaseSettings):
     # LLM (Ollama - free & local)
     ollama_base_url: str = Field(default="http://localhost:11434", env="OLLAMA_BASE_URL")
-    ollama_model: str = Field(default="llama3.2", env="OLLAMA_MODEL")
+    ollama_model: str = Field(default="llama3", env="OLLAMA_MODEL")
+
+    # Separate model for SPARQL generation (code-oriented model gives cleaner queries)
+    sparql_model: str = Field(default="llama3", env="SPARQL_MODEL")
 
     # Embeddings
     embedding_model: str = Field(default="nomic-embed-text", env="EMBEDDING_MODEL")
@@ -41,9 +44,8 @@ class Settings(BaseSettings):
     chunk_size: int = Field(default=1000, env="CHUNK_SIZE")
     chunk_overlap: int = Field(default=200, env="CHUNK_OVERLAP")
 
-    # GPUs
     num_gpu: int = Field(default=1, env="NUM_GPU")
-    
+
     class Config:
         env_file = str(PROJECT_ROOT / ".env")
         env_file_encoding = "utf-8"
