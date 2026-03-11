@@ -23,7 +23,7 @@ mcp = FastMCP(
 )
 
 
-# ── Shared helper ──────────────────────────────────────────────────────────────
+# ── Shared helper ──
 
 def _ingest_one_file(file_path: str) -> dict:
     """Load and ingest a single file. Returns a result dict."""
